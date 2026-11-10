@@ -1,3 +1,4 @@
+import base64
 import errno
 import json
 import logging
@@ -25,6 +26,7 @@ from cephadm.utils import (
     SERIAL_UPGRADE_DAEMON_TYPES,
     ALL_GATEWAY_TYPES,
     ALLOWED_CIPHERS,
+    ROTATION_CIPHER,
     SERVICE_CIPHER,
     allowed_ciphers_are_aes256k_only,
     auth_allowed_cipher_names_from_mon_map,
@@ -65,6 +67,13 @@ MID_UPGRADE_MUTED_WARNINGS = [
     'AUTH_INSECURE_SERVICE_KEY_TYPE',
     'AUTH_INSECURE_ROTATING_SERVICE_KEY_TYPE'
 ]
+
+# cephx key type ids (CEPH_CRYPTO_* in src/include/ceph_fs.h). A key string is the
+# base64 of the encoded CryptoKey, whose first two bytes are the type (__u16 LE).
+CEPHX_KEY_TYPE_IDS: Dict[str, int] = {
+    'aes': 1,
+    'aes256k': 2,
+}
 
 # Minimum x86-64 microarchitecture level required to run the official builds
 # of a given major release. Hosts whose CPUs do not support that level will
@@ -2019,6 +2028,16 @@ class CephadmUpgrade:
             _, mons_needing_upgrade, __, ___ = self._detect_need_upgrade(mon_daemons, target_digests, target_image)
             need_rotate_self = False
             if not mons_needing_upgrade:
+                # The rotated list lives in the UpgradeState, which every
+                # `ceph orch upgrade start` creates anew, so every start (each
+                # step of a staggered upgrade) rotated the mgr keys and the
+                # shared mon. key again, redeployed every mgr and mon and failed
+                # the active mgr over (https://tracker.ceph.com/issues/80292).
+                # The rotation moves these keys to ROTATION_CIPHER: a key that
+                # already is of that type counts as rotated.
+                self._skip_mgr_mon_keys_of_rotation_cipher(mon_daemons)
+                if self._mgr_mon_key_rotation_done(mon_daemons):
+                    return
                 if not self.upgrade_state.has_set_cephx_allowed_ciphers:
                     # all mons have been upgraded if we get here so keyrings can be rotated
                     # start by setting the allowed ciphers. Preferred ciphers should be left
@@ -2038,6 +2057,7 @@ class CephadmUpgrade:
                         continue
                     daemon_spec = CephadmDaemonDeploySpec.from_daemon_description(dd)
                     logger.info('Rotating keyring for %s', dd.name())
+                    self._key_rotation_pending_add([dd.name()])
                     self.mgr.key_rotate(daemon_spec)
                     assert dd.daemon_type is not None
                     assert dd.daemon_id is not None
@@ -2051,10 +2071,12 @@ class CephadmUpgrade:
                     self.mgr._daemon_action(daemon_spec, action='redeploy')
                     self.upgrade_state.rotated_mgr_mon_auth_key_daemons.append(daemon_spec.name())
                     self._save_upgrade_state()
+                    self._key_rotation_pending_remove([daemon_spec.name()])
                 # mon daemons share a key, only do one key rotation
                 # but still trigger redeploy for each mon
                 if 'mon' not in self.upgrade_state.rotated_mgr_mon_auth_key_daemons:
                     logger.info('Rotating mon keyring')
+                    self._key_rotation_pending_add(['mon'] + [dd.name() for dd in mon_daemons])
                     self.mgr.key_rotate(
                         CephadmDaemonDeploySpec.from_daemon_description(
                             mon_daemons[0]
@@ -2078,11 +2100,109 @@ class CephadmUpgrade:
                     self.mgr._daemon_action(daemon_spec, action='redeploy')
                     self.upgrade_state.rotated_mgr_mon_auth_key_daemons.append(daemon_spec.name())
                     self._save_upgrade_state()
+                    self._key_rotation_pending_remove([daemon_spec.name()])
+                self._key_rotation_pending_remove(['mon'] + [dd.name() for dd in mon_daemons])
             else:
                 self.mgr.log.debug('Skipping mgr/mon key rotation, mons not upgraded')
             if need_rotate_self:
                 logger.info('Failing over to standby mgr to handle key rotation of current active mgr')
                 self.mgr.mgr_service.fail_over()
+
+    def _cephx_key_is_rotation_cipher(self, entity: str) -> bool:
+        # True only if the entity's current key already is of ROTATION_CIPHER's
+        # type; anything unexpected returns False, i.e. the key gets rotated
+        want = CEPHX_KEY_TYPE_IDS.get(ROTATION_CIPHER)
+        try:
+            ret, out, err = self.mgr.mon_command({
+                'prefix': 'auth get',
+                'entity': entity,
+                'format': 'json',
+            })
+            if ret:
+                logger.info('Upgrade: auth get %s failed (retval %s); rotating its key', entity, ret)
+                return False
+            entries = [e for e in json.loads(out) if e.get('entity') == entity]
+            if len(entries) != 1:
+                logger.info('Upgrade: no single auth entry for %s; rotating its key', entity)
+                return False
+            raw = base64.b64decode(entries[0]['key'], validate=True)
+            key_type = int.from_bytes(raw[0:2], 'little') if len(raw) >= 2 else None
+        except Exception as e:
+            # never log the output: it holds the key
+            logger.info('Upgrade: cannot read the key type of %s (%s); rotating its key',
+                        entity, type(e).__name__)
+            return False
+        return want is not None and key_type == want
+
+    # Daemons whose key was rotated but whose redeploy (the new keyring file) has
+    # not been done yet. Kept in the store, outside the UpgradeState, so a key
+    # rotated just before a failure, a failover or `orch upgrade stop` is never
+    # taken for "already aes256k, nothing to do": it is rotated and redeployed again.
+    KEY_ROTATION_PENDING_STORE = 'upgrade_mgr_mon_key_rotation_pending'
+
+    def _key_rotation_pending(self) -> Set[str]:
+        try:
+            return set(json.loads(self.mgr.get_store(self.KEY_ROTATION_PENDING_STORE) or '[]'))
+        except Exception:
+            # unreadable: treat every mgr/mon as pending (rotate, as before)
+            return {'*'}
+
+    def _key_rotation_pending_add(self, names: List[str]) -> None:
+        pending = self._key_rotation_pending() - {'*'}
+        self.mgr.set_store(self.KEY_ROTATION_PENDING_STORE, json.dumps(sorted(pending | set(names))))
+
+    def _key_rotation_pending_remove(self, names: List[str]) -> None:
+        pending = self._key_rotation_pending()
+        if '*' in pending:
+            return
+        left = pending - set(names)
+        if left != pending:
+            self.mgr.set_store(self.KEY_ROTATION_PENDING_STORE, json.dumps(sorted(left)) if left else None)
+
+    def _skip_mgr_mon_keys_of_rotation_cipher(self, mon_daemons: List[DaemonDescription]) -> None:
+        # record mgr keys and the shared mon. key that already are of
+        # ROTATION_CIPHER's type as rotated, so they are neither rotated nor
+        # redeployed (nor the active mgr failed over) for them
+        assert self.upgrade_state is not None
+        assert self.upgrade_state.rotated_mgr_mon_auth_key_daemons is not None
+        rotated = self.upgrade_state.rotated_mgr_mon_auth_key_daemons
+        pending = self._key_rotation_pending()
+        if '*' in pending:
+            return
+        changed = False
+        for dd in self.mgr.cache.get_daemons_by_service('mgr'):
+            if dd.name() in rotated or dd.name() in pending:
+                continue
+            entity = CephadmDaemonDeploySpec.from_daemon_description(dd).entity_name()
+            if self._cephx_key_is_rotation_cipher(entity):
+                logger.info('Upgrade: key of %s already is %s, not rotating it', dd.name(), ROTATION_CIPHER)
+                rotated.append(dd.name())
+                changed = True
+        # A mon. key rotation whose mon redeploys are not all done is in the
+        # pending record ('mon' plus the mons not yet redeployed): nothing is
+        # skipped then. Otherwise, with mon. already aes256k, every mon not yet
+        # in the list (also one added later; a new mon is deployed with the
+        # current mon. key) needs neither a rotation nor a redeploy.
+        mons_left = [dd.name() for dd in mon_daemons if dd.name() not in rotated]
+        if ('mon' not in rotated or mons_left) and 'mon' not in pending \
+                and not any(dd.name() in pending for dd in mon_daemons):
+            entity = CephadmDaemonDeploySpec.from_daemon_description(mon_daemons[0]).entity_name()
+            if self._cephx_key_is_rotation_cipher(entity):
+                logger.info('Upgrade: key of %s already is %s, not rotating it or redeploying the mons',
+                            entity, ROTATION_CIPHER)
+                if 'mon' not in rotated:
+                    rotated.append('mon')
+                rotated.extend(mons_left)
+                changed = True
+        if changed:
+            self._save_upgrade_state()
+
+    def _mgr_mon_key_rotation_done(self, mon_daemons: List[DaemonDescription]) -> bool:
+        assert self.upgrade_state is not None
+        rotated = self.upgrade_state.rotated_mgr_mon_auth_key_daemons or []
+        return ('mon' in rotated
+                and all(dd.name() in rotated for dd in mon_daemons)
+                and all(dd.name() in rotated for dd in self.mgr.cache.get_daemons_by_service('mgr')))
 
     def _upgrade_daemons(self, to_upgrade: List[Tuple[DaemonDescription, bool]], target_image: str, target_digests: Optional[List[str]] = None) -> None:
         assert self.upgrade_state is not None
