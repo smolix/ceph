@@ -2637,3 +2637,253 @@ def test_do_upgrade_persists_skipped_health_warning_mutes(
     cephadm_module.upgrade._do_upgrade()
 
     _mute_upgrade_related_health_warnings.assert_called_once_with()
+
+
+# mgr/mon key rotation only for keys not yet of ROTATION_CIPHER's type
+# (https://tracker.ceph.com/issues/80292)
+
+def _cephx_key(key_type: int) -> str:
+    import base64
+    secret = b'k' * (32 if key_type == 2 else 16)
+    raw = key_type.to_bytes(2, 'little') + b'\x00' * 8 + len(secret).to_bytes(2, 'little') + secret
+    return base64.b64encode(raw).decode()
+
+
+AES_KEY = _cephx_key(1)
+AES256K_KEY = _cephx_key(2)
+
+
+def _auth_mon_command(keys: dict, mutes: Optional[List[str]] = None, calls: Optional[list] = None):
+    def _mon_command(cmd_dict, inbuf=None):
+        if calls is not None:
+            calls.append(cmd_dict)
+        if cmd_dict['prefix'] == 'auth get':
+            entity = cmd_dict['entity']
+            if entity not in keys:
+                return -2, '', f'failed to find {entity} in keyring'
+            return 0, json.dumps([{'entity': entity, 'key': keys[entity], 'caps': {}}]), ''
+        if cmd_dict['prefix'] == 'health':
+            if mutes is None:
+                return -22, '', 'unreadable'
+            return 0, json.dumps({'status': 'HEALTH_WARN', 'checks': {},
+                                  'mutes': [c if isinstance(c, dict) else {'code': c, 'sticky': True}
+                                            for c in mutes]}), ''
+        return 0, '', ''
+    return _mon_command
+
+
+def _mgr_mon_daemons():
+    mgrs = [DaemonDescription(daemon_type='mgr', daemon_id='x', hostname='test'),
+            DaemonDescription(daemon_type='mgr', daemon_id='y', hostname='test2')]
+    mons = [DaemonDescription(daemon_type='mon', daemon_id='a', hostname='test'),
+            DaemonDescription(daemon_type='mon', daemon_id='b', hostname='test2')]
+    return mgrs, mons
+
+
+def _run_rotation(cephadm_module, keys, state=None, action_fail=None, extra_mons=()):
+    mgrs, mons = _mgr_mon_daemons()
+    mons += [DaemonDescription(daemon_type='mon', daemon_id=m, hostname='test3') for m in extra_mons]
+
+    def _action(spec, action=None, **kw):
+        if spec.name() == action_fail:
+            raise OrchestratorError(f'redeploy of {action_fail} failed')
+        return ''
+    calls: list = []
+    if state is None:
+        state = UpgradeState('target_image', '0')
+    cephadm_module.upgrade.upgrade_state = state
+    with mock.patch('cephadm.module.HostCache.get_daemons_by_service',
+                    side_effect=lambda s: {'mgr': mgrs, 'mon': mons}.get(s, [])), \
+            mock.patch.object(CephadmUpgrade, '_detect_need_upgrade', return_value=(False, [], [], 0)), \
+            mock.patch.object(cephadm_module, 'mon_command', side_effect=_auth_mon_command(keys, calls=calls)), \
+            mock.patch.object(cephadm_module, 'check_mon_command', return_value=(0, '', '')) as check_mon_command, \
+            mock.patch.object(cephadm_module, 'key_rotate') as key_rotate, \
+            mock.patch.object(cephadm_module, '_daemon_action_set_image') as set_image, \
+            mock.patch.object(cephadm_module, '_daemon_action', side_effect=_action) as daemon_action, \
+            mock.patch.object(cephadm_module, 'daemon_is_self',
+                              side_effect=lambda t, i: t == 'mgr' and i == 'x'), \
+            mock.patch.object(cephadm_module.mgr_service, 'fail_over') as fail_over:
+        if action_fail:
+            with pytest.raises(OrchestratorError):
+                cephadm_module.upgrade._rotate_mgr_mon_auth_keys('target_image', ['digest1'])
+        else:
+            cephadm_module.upgrade._rotate_mgr_mon_auth_keys('target_image', ['digest1'])
+    return {
+        'auth_gets': [c['entity'] for c in calls if c['prefix'] == 'auth get'],
+        'rotated_keys': [c.args[0].entity_name() for c in key_rotate.call_args_list],
+        'redeployed': [c.args[0].name() for c in daemon_action.call_args_list],
+        'set_image': [f'{c.args[2]}.{c.args[3]}' for c in set_image.call_args_list],
+        'mon_set': [c.args[0] for c in check_mon_command.call_args_list if c.args[0]['prefix'] == 'mon set'],
+        'fail_over': fail_over.call_count,
+        'state': state,
+    }
+
+
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+def test_rotate_mgr_mon_auth_keys_skips_keys_already_aes256k(cephadm_module: CephadmOrchestrator):
+    # every mgr key and mon. already aes256k: no rotation, no redeploy, no failover,
+    # no 'mon set auth_allowed_ciphers'; a second call issues no mon command at all
+    keys = {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES256K_KEY}
+    r = _run_rotation(cephadm_module, keys)
+    assert r['auth_gets'] == ['mgr.x', 'mgr.y', 'mon.']
+    assert r['rotated_keys'] == [] and r['redeployed'] == [] and r['set_image'] == []
+    assert r['mon_set'] == [] and r['fail_over'] == 0
+    assert sorted(r['state'].rotated_mgr_mon_auth_key_daemons) == ['mgr.x', 'mgr.y', 'mon', 'mon.a', 'mon.b']
+    assert not r['state'].has_set_cephx_allowed_ciphers
+    r2 = _run_rotation(cephadm_module, keys, state=r['state'])
+    assert r2['auth_gets'] == [] and r2['rotated_keys'] == [] and r2['redeployed'] == [] and r2['fail_over'] == 0
+
+
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+def test_rotate_mgr_mon_auth_keys_new_state_per_start(cephadm_module: CephadmOrchestrator):
+    # the bug: each `orch upgrade start` makes a new UpgradeState. With the keys
+    # already aes256k a fresh state must not rotate anything either.
+    keys = {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES256K_KEY}
+    for _ in range(3):
+        r = _run_rotation(cephadm_module, keys, state=UpgradeState('target_image', '0'))
+        assert r['rotated_keys'] == [] and r['redeployed'] == [] and r['fail_over'] == 0 and r['mon_set'] == []
+
+
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+def test_rotate_mgr_mon_auth_keys_rotates_insecure_keys(cephadm_module: CephadmOrchestrator):
+    # aes keys (first upgrade to this release): upstream behaviour unchanged
+    keys = {'mgr.x': AES_KEY, 'mgr.y': AES_KEY, 'mon.': AES_KEY}
+    r = _run_rotation(cephadm_module, keys)
+    assert r['mon_set'] == [{'prefix': 'mon set', 'name': 'auth_allowed_ciphers', 'value': 'aes,aes256k'}]
+    assert r['rotated_keys'] == ['mgr.y', 'mon.']        # mgr.x is self: after the failover
+    assert r['redeployed'] == ['mgr.y', 'mon.a', 'mon.b']
+    assert r['set_image'] == ['mgr.y', 'mon.a', 'mon.b']
+    assert r['fail_over'] == 1
+    assert r['state'].has_set_cephx_allowed_ciphers
+    # the new active mgr (y) continues the same state: mgr.x still aes -> rotated now
+    mgrs, mons = _mgr_mon_daemons()
+    keys2 = {'mgr.x': AES_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES256K_KEY}
+    with mock.patch.object(cephadm_module, 'daemon_is_self', side_effect=lambda t, i: t == 'mgr' and i == 'y'):
+        state = r['state']
+        cephadm_module.upgrade.upgrade_state = state
+        with mock.patch('cephadm.module.HostCache.get_daemons_by_service',
+                        side_effect=lambda s: {'mgr': mgrs, 'mon': mons}.get(s, [])), \
+                mock.patch.object(CephadmUpgrade, '_detect_need_upgrade', return_value=(False, [], [], 0)), \
+                mock.patch.object(cephadm_module, 'mon_command', side_effect=_auth_mon_command(keys2)), \
+                mock.patch.object(cephadm_module, 'check_mon_command', return_value=(0, '', '')) as check_mon_command, \
+                mock.patch.object(cephadm_module, 'key_rotate') as key_rotate, \
+                mock.patch.object(cephadm_module, '_daemon_action_set_image'), \
+                mock.patch.object(cephadm_module, '_daemon_action') as daemon_action, \
+                mock.patch.object(cephadm_module.mgr_service, 'fail_over') as fail_over:
+            cephadm_module.upgrade._rotate_mgr_mon_auth_keys('target_image', ['digest1'])
+        assert [c.args[0].entity_name() for c in key_rotate.call_args_list] == ['mgr.x']
+        assert [c.args[0].name() for c in daemon_action.call_args_list] == ['mgr.x']
+        assert fail_over.call_count == 0
+        assert not [c for c in check_mon_command.call_args_list if c.args[0]['prefix'] == 'mon set']
+
+
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+def test_rotate_mgr_mon_auth_keys_mixed(cephadm_module: CephadmOrchestrator):
+    # only the aes key is rotated; the active mgr's aes256k key needs no failover,
+    # the aes256k mon. key no mon redeploys
+    keys = {'mgr.x': AES256K_KEY, 'mgr.y': AES_KEY, 'mon.': AES256K_KEY}
+    r = _run_rotation(cephadm_module, keys)
+    assert r['rotated_keys'] == ['mgr.y']
+    assert r['redeployed'] == ['mgr.y']
+    assert r['fail_over'] == 0
+    assert len(r['mon_set']) == 1
+    # only mon. insecure: mon. rotated and both mons redeployed, no mgr touched
+    r = _run_rotation(cephadm_module, {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES_KEY})
+    assert r['rotated_keys'] == ['mon.']
+    assert r['redeployed'] == ['mon.a', 'mon.b']
+    assert r['fail_over'] == 0
+
+
+@pytest.mark.parametrize('keys', [
+    {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY},                       # mon. not found
+    {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': 'not base64!'},
+    {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': ''},
+    {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': _cephx_key(0)},
+    {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': _cephx_key(3)},
+])
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+def test_rotate_mgr_mon_auth_keys_unknown_key_type_rotates(keys, cephadm_module: CephadmOrchestrator):
+    # anything but a readable aes256k key keeps the upstream behaviour (rotate)
+    r = _run_rotation(cephadm_module, keys)
+    assert r['rotated_keys'] == ['mon.']
+    assert r['redeployed'] == ['mon.a', 'mon.b']
+
+
+def test_cephx_key_is_rotation_cipher_entity_mismatch(cephadm_module: CephadmOrchestrator):
+    out = json.dumps([{'entity': 'mgr.z', 'key': AES256K_KEY, 'caps': {}}])
+    with mock.patch.object(cephadm_module, 'mon_command', return_value=(0, out, '')):
+        assert not cephadm_module.upgrade._cephx_key_is_rotation_cipher('mgr.x')
+    out = json.dumps([{'entity': 'mgr.x', 'key': AES256K_KEY, 'caps': {}}])
+    with mock.patch.object(cephadm_module, 'mon_command', return_value=(0, out, '')):
+        assert cephadm_module.upgrade._cephx_key_is_rotation_cipher('mgr.x')
+
+
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+def test_rotate_mgr_mon_auth_keys_mon_added_later(cephadm_module: CephadmOrchestrator):
+    # a mon that shows up after the skip (same state): with mon. aes256k it needs no
+    # rotation pass (no 'mon set auth_allowed_ciphers', no mon redeploys)
+    keys = {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES256K_KEY}
+    r = _run_rotation(cephadm_module, keys)
+    r2 = _run_rotation(cephadm_module, keys, state=r['state'], extra_mons=['c'])
+    assert r2['auth_gets'] == ['mon.']
+    assert r2['rotated_keys'] == [] and r2['redeployed'] == [] and r2['mon_set'] == []
+    assert 'mon.c' in r2['state'].rotated_mgr_mon_auth_key_daemons
+    # also after a real mon. rotation in this state that finished
+    r = _run_rotation(cephadm_module, {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES_KEY})
+    assert r['rotated_keys'] == ['mon.'] and r['redeployed'] == ['mon.a', 'mon.b']
+    r2 = _run_rotation(cephadm_module, keys, state=r['state'], extra_mons=['c'])
+    assert r2['rotated_keys'] == [] and r2['redeployed'] == [] and r2['mon_set'] == []
+    # but not while that rotation's mon redeploys are unfinished: mon.b and the new mon are redeployed
+    r = _run_rotation(cephadm_module, {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES_KEY},
+                      action_fail='mon.b')
+    r2 = _run_rotation(cephadm_module, keys, state=r['state'], extra_mons=['c'])
+    assert r2['rotated_keys'] == [] and r2['redeployed'] == ['mon.b', 'mon.c']
+
+
+def _pending(cephadm_module):
+    return json.loads(cephadm_module.get_store('upgrade_mgr_mon_key_rotation_pending') or '[]')
+
+
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+def test_rotate_mgr_mon_auth_keys_pending_mgr_redeploy(cephadm_module: CephadmOrchestrator):
+    # mgr.y's key is rotated but its redeploy fails: a later start (new state) must
+    # not take the now-aes256k key for "nothing to do" and must redeploy mgr.y
+    r = _run_rotation(cephadm_module, {'mgr.x': AES256K_KEY, 'mgr.y': AES_KEY, 'mon.': AES_KEY},
+                      action_fail='mgr.y')
+    assert r['rotated_keys'] == ['mgr.y']
+    assert _pending(cephadm_module) == ['mgr.y']
+    keys = {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES256K_KEY}
+    r = _run_rotation(cephadm_module, keys, state=UpgradeState('target_image', '0'))
+    assert r['rotated_keys'] == ['mgr.y'] and r['redeployed'] == ['mgr.y'] and r['fail_over'] == 0
+    assert _pending(cephadm_module) == []
+    r = _run_rotation(cephadm_module, keys, state=UpgradeState('target_image', '0'))
+    assert r['rotated_keys'] == [] and r['redeployed'] == []
+
+
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+def test_rotate_mgr_mon_auth_keys_pending_mon_redeploy(cephadm_module: CephadmOrchestrator):
+    # mon. rotated, mon.a redeployed, mon.b's redeploy fails
+    r = _run_rotation(cephadm_module, {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES_KEY},
+                      action_fail='mon.b')
+    assert r['rotated_keys'] == ['mon.']
+    assert _pending(cephadm_module) == ['mon', 'mon.b']
+    # same state (resume / mgr failover): upstream continues with mon.b only
+    keys = {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES256K_KEY}
+    r2 = _run_rotation(cephadm_module, keys, state=r['state'])
+    assert r2['rotated_keys'] == [] and r2['redeployed'] == ['mon.b']
+    assert _pending(cephadm_module) == []
+    # a new start after a stop in that window: mon. rotated again, every mon redeployed
+    _run_rotation(cephadm_module, {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES_KEY}, action_fail='mon.b')
+    assert _pending(cephadm_module) == ['mon', 'mon.b']
+    r3 = _run_rotation(cephadm_module, keys, state=UpgradeState('target_image', '0'))
+    assert r3['rotated_keys'] == ['mon.'] and r3['redeployed'] == ['mon.a', 'mon.b']
+    assert _pending(cephadm_module) == []
+
+
+@mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+def test_rotate_mgr_mon_auth_keys_pending_unreadable(cephadm_module: CephadmOrchestrator):
+    # an unreadable pending record disables the skip (rotate as before)
+    cephadm_module.set_store('upgrade_mgr_mon_key_rotation_pending', 'not json')
+    r = _run_rotation(cephadm_module, {'mgr.x': AES256K_KEY, 'mgr.y': AES256K_KEY, 'mon.': AES256K_KEY})
+    assert r['rotated_keys'] == ['mgr.y', 'mon.'] and r['fail_over'] == 1
+    assert _pending(cephadm_module) == []
